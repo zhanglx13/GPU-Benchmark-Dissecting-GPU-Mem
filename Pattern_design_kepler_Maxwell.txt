@@ -1,0 +1,31 @@
+Array size: 1600 MB
+
+read 256 times, from cold to warm
+
+1) stride = 32 MB, * 49
+	a. L1+L2 TLB miss, cache miss)
+	b. L1+L2 TLB miss, page table "miss", cache miss)
+	
+set the 1568 MB entry points to 1569 MB
+	
+2) stride = 1 MB, * 16
+	a.  * (L1+L2 TLB miss, cache miss)
+	c.  * (L1 TLB hit, cache miss)
+	alternate
+set the 1598 MB entry point to 1599 MB, and 1599 MB entry point to the second element, 4 byte. 
+Up to now, The L2 TLB entry is full. The following read data are all cached in L2, entry all cached in L2 TLB
+
+3) stride = 32 MB * 48
+	d. ( L1 TLB miss, L2 TLB hit, cache hit)
+Now the read goes to 1568 MB + 4 byte. 
+The L2 TLB is full with each entry visited twice
+
+//4) stride = 2MB
+//	e. L2 TLB miss, cache hit
+// mapping algorithm is rather random, difficult to generate
+
+
+5) 1568 MB cache line, initialized as: |1569 MB|1568MB+4*2byte|1568MB+4*3 byte|1568 MB + 4 * 1 byte|, so that there would be a circle, all read are 
+	e. (L1 TLB + L2 cache hit)
+until to the end. 
+	

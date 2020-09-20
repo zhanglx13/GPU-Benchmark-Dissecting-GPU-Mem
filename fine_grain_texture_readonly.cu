@@ -1,9 +1,21 @@
+/*
+ * To compile for the read-only cache experiment (must explicitly specify
+ * -arch-sm_xx since __ldg only works for GPU with cc>=35)
+ *     Kepler: nvcc -arch=sm_35 -DRO fine_grain_texture_L1.cu -o test
+ *     Pascal: nvcc -arch=sm_61 -DRO fine_grain_texture_L1.cu -o test
+ * To compile fot the texture cache experiment
+ *     nvcc -DTX fine_grain_texture_L1.cu -o test
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 
 //declare the texture
+#if defined TX
 texture<int, 1, cudaReadModeElementType> tex_ref;
-
+#elif defined RO
+#include "cuda_runtime.h"
+#endif
 /*
  * We are going to traverse the array with a stride of _stride_
  * So the number of accesses in the array is N/_stride_,
@@ -47,7 +59,7 @@ texture<int, 1, cudaReadModeElementType> tex_ref;
  *
  * The above problem can be solved by warming up the cache first before
  * recording s_tvalue and s_value. Since the cache is warmed up, we only
- * need to go a few iterations to see the pattern, i.e. ITER = 128.
+ * need to go a few iterations to see the pattern, i.e. ITER = 256.
  *
  * Shared Memory (KB/SM)
  * ===================================================================================
@@ -70,13 +82,43 @@ texture<int, 1, cudaReadModeElementType> tex_ref;
 // #define  ITER 3072
 // #endif
 
-#define ITER 128
+/*
+ * The layout of textture cache and read-only cache is as follows:
+ *
+ * | Set 0   | Set 1   | Set 2   | Set 3   |
+ * |---------|---------|---------|---------|
+ * | line 0  | line 4  | line 8  | line 12 |
+ * | line 1  | line 5  | line 9  | line 13 |
+ * | line 2  | line 6  | line 10 | line 14 |
+ * | line 3  | line 7  | line 11 | line 15 |
+ * | line 16 | line 20 | line 24 | line 28 |
+ * | line 17 | line 21 | line 25 | line 29 |
+ * | line 18 | line 22 | line 26 | line 30 |
+ * | line 19 | line 23 | line 27 | line 31 |
+ * ....
+ * When the replacement policy is LRU, one line miss in a set means evey line
+ * in the same set will miss. If we want to see a pattern that every line
+ * in set 0 will miss, we need to access at least 17 lines of data, i.e.
+ * ITER >= 129.
+ * Therefore, we choose ITER = 256 so that we won't moss such a pattern.
+ */
 
-__global__ void texture_latency (int * my_array,
-                                 int size,
-                                 unsigned int *duration,
-                                 int *index,
-                                 int iter /* used to warm up the cache*/
+/*
+ * The layout of the read-only cache is different, since the memory addressing
+ * is rather random.
+ */
+#define ITER 256
+
+__global__ void cache_latency (
+#if defined TX
+    int * my_array,
+#elif defined RO
+    const int * __restrict__ my_array,
+#endif
+    int size,
+    unsigned int *duration,
+    int *index,
+    int iter /* used to warm up the cache*/
     ) {
 
     // extern __shared__ int s[];
@@ -105,7 +147,11 @@ __global__ void texture_latency (int * my_array,
      * Note that to warm up the cache, we need to traverse the whole array.
      */
     for (int cnt=0; cnt < iter; cnt++){
+#if defined TX
         j=tex1Dfetch(tex_ref, j);
+#elif defined RO
+        j = __ldg(&my_array[j]);
+#endif
     }
     /*
      * Since cold cache miss is avoided, the cache structure can
@@ -114,7 +160,11 @@ __global__ void texture_latency (int * my_array,
     for (int cnt=0; cnt < it; cnt++) {
 			
         start=clock();
+#if defined TX
         j=tex1Dfetch(tex_ref, j);
+#elif defined RO
+        j = __ldg(&my_array[j]);
+#endif
         s_value[cnt] = j;
 			
         end=clock();
@@ -126,13 +176,13 @@ __global__ void texture_latency (int * my_array,
 	index[i] = s_value[i];
     }
 
-    my_array[size] = i;
-    my_array[size+1] = s_tvalue[i-1];
+    // my_array[size] = i;
+    // my_array[size+1] = s_tvalue[i-1];
 }
 
 
 
-void parametric_measure_texture(int N, int stride) {
+void parametric_measure(int N, int stride) {
     // iterations=stride=1
     // N is the array size
 
@@ -182,7 +232,9 @@ void parametric_measure_texture(int N, int stride) {
 
 
     //bind texture
+#if defined TX
     cudaBindTexture(0, tex_ref, d_a, size );
+#endif
 
     cudaDeviceSynchronize ();
 
@@ -197,7 +249,7 @@ void parametric_measure_texture(int N, int stride) {
     dim3 Db = dim3(1);
     dim3 Dg = dim3(1,1,1);
     // texture_latency <<<Dg, Db, iter*2*sizeof(int)>>>(d_a, size, d_duration, d_index, iterations);
-    texture_latency <<<Dg, Db>>>(d_a, size, d_duration, d_index, iterations);
+    cache_latency <<<Dg, Db>>>(d_a, size, d_duration, d_index, iterations);
 
     cudaDeviceSynchronize ();
 
@@ -222,7 +274,9 @@ void parametric_measure_texture(int N, int stride) {
 
 
     //unbind texture
+#ifdef TX
     cudaUnbindTexture(tex_ref);
+#endif
 
     //free memory on GPU
     cudaFree(d_a);
@@ -275,19 +329,7 @@ int main(int argc, char *argv[]) {
      *    see a sudden increase on the cache miss, say N=3081, we can infer
      *    the cache line size b = 3081-3073 = 8 integers = 32 B
      */
-
-    // stage1: overflow with 1 element
-    //stride = 1; // in element
-    //for (N = 6145; N <=6145; N += stride) {
-    parametric_measure_texture(N, stride);
-    //}
-/*
-// stage2: overflow with cache lines
-stride = 8; // in element
-for (N = 3072; N <=3200; N += stride) {
-parametric_measure_texture(N+2, iterations, stride);
-}
-*/
+    parametric_measure(N, stride);
 
     cudaDeviceReset();
     //printf("\"%s\": cc=%d.%d, texture cache size=%d KB, shared memory=%ld KB\n",
